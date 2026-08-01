@@ -1,246 +1,302 @@
-"""WAGS Insight — Gradio UI on a FastAPI app. Wiring only.
+"""ROUTER — the LLM decides: is this a data question or not?
 
-    .venv/bin/python main.py            # http://localhost:7860
+    python main.py                          # a few sample questions
+    python main.py "give me sales"          # one question
+    python main.py "hi" "total sales"       # several
+    python main.py --raw "sales by branch"  # also dump the raw Odoo rows
 
-One turn:
-    call one  -> clarifying question, or tool arguments
-    query     -> builder + Odoo + returns maths (no model involved)
-    call two  -> the sentence, in the language asked
-    store     -> both calls logged to Supabase with exact token counts
+Augmentation is deliberately not here yet. There is no second LLM call and no
+prose answer. The point right now is to see, for any question:
 
-The logic lives in builder/query/llm/store. This file only connects them.
+    what the LLM chose  ->  the exact query  ->  what came back
+
+Once the query and the output shape are right, the answer-writing goes on top.
 """
 
 from __future__ import annotations
 
-import uuid
-from dataclasses import dataclass, field
-from datetime import date
+import json
+import os
+import sys
+import time
 from typing import Optional
 
-import gradio as gr
-from fastapi import FastAPI
+from groq import Groq
 
-import rpc
-from config import Settings, settings
-from llm import Llm
-from query import QueryResult, QueryRunner
-from store import Store
+import odoo_db
+from odoo_db import (METRICS, PERIODS, Lookups, Odoo, OdooError, Query,
+                     QueryError, build_query, summarise)
 
-# Local data stops in Dec 2025 while the real clock says 2026, so relative
-# periods would all be empty. Point "today" at the last day with data when there
-# is no date floor, i.e. local testing. With a floor set, use the real date.
-LOCAL_TEST_TODAY = date(2025, 12, 11)
+MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+W = 78
+DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
+GREEN, RED, YELLOW, CYAN = "\033[32m", "\033[31m", "\033[33m", "\033[36m"
 
 
-@dataclass
-class Turn:
-    """Everything one question produced. Also what the golden run records."""
+# ------------------------------------------------------------------ printing
 
-    question: str
-    session_id: str
-    tool_args: Optional[dict] = None
-    clarification: str = ""
-    answer: str = ""
-    result: Optional[QueryResult] = None
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    latency_ms: int = 0
-    store_ids: list = field(default_factory=list)
-    error: str = ""
-
-    @property
-    def status(self) -> str:
-        if self.error:
-            return "ERROR"
-        if self.clarification:
-            return "CLARIFY"
-        if self.result is not None and not self.result.ok:
-            return "BLOCKED"
-        return "PASS"
+def head(text: str, colour: str = CYAN) -> None:
+    print(f"\n{colour}{'━' * W}\n{text}\n{'━' * W}{RESET}")
 
 
-class App:
-    def __init__(self, cfg: Optional[Settings] = None):
-        self.cfg = cfg or settings()
-        self.odoo = rpc.connect(self.cfg)
-        self.lookups = self.odoo.load_lookups()
-        self.today_fn = (lambda: date.today()) if self.cfg.has_date_floor \
-            else (lambda: LOCAL_TEST_TODAY)
-        self.runner = QueryRunner(self.odoo, self.cfg, self.lookups,
-                                  today_fn=self.today_fn)
-        self.llm = Llm(self.cfg, self.lookups, today_fn=self.today_fn)
-        self.store = Store(self.cfg)
-
-    def refresh_lookups(self) -> None:
-        """Re-read the reference models without a restart."""
-        self.lookups = self.odoo.load_lookups()
-        self.runner.lookups = self.lookups
-        self.llm.lookups = self.lookups
-
-    # -------------------------------------------------------------------- turn
-
-    def ask(self, question: str, history: Optional[list] = None,
-            session_id: str = "") -> Turn:
-        session_id = session_id or uuid.uuid4().hex[:12]
-        turn = Turn(question=question, session_id=session_id)
-
-        turn.store_ids.append(
-            self.store.log_message(session_id=session_id, role="user",
-                                   content=question))
-
-        # --- call one
-        try:
-            one = self.llm.choose_query(question, history=history)
-        except Exception as exc:                        # noqa: BLE001
-            turn.error = f"The model call failed: {exc}"
-            # Mirror it into answer so the chat window and the API both show
-            # something. Never a figure — rule 9.
-            turn.answer = turn.error
-            return turn
-
-        turn.prompt_tokens += one.usage.prompt_tokens
-        turn.completion_tokens += one.usage.completion_tokens
-        turn.latency_ms += one.usage.latency_ms
-
-        if not one.wants_query:
-            turn.clarification = one.clarification or (
-                "Could you say a bit more about what you need?")
-            turn.answer = turn.clarification
-            turn.store_ids.append(self.store.log_message(
-                session_id=session_id, role="assistant",
-                content=turn.clarification,
-                prompt_tokens=one.usage.prompt_tokens,
-                completion_tokens=one.usage.completion_tokens,
-                model=one.usage.model, latency_ms=one.usage.latency_ms))
-            return turn
-
-        turn.tool_args = one.tool_args
-
-        # --- the query. No model involvement.
-        result = self.runner.run(one.tool_args)
-        turn.result = result
-        turn.store_ids.append(self.store.log_message(
-            session_id=session_id, role="tool",
-            tool_args=one.tool_args, tool_result=result.for_model(),
-            latency_ms=int(result.elapsed_ms)))
-
-        # --- call two. Runs even on failure, so the user is told it failed
-        # --- rather than being handed silence.
-        try:
-            two = self.llm.write_answer(question, result.for_model(),
-                                        tool_args=one.tool_args)
-        except Exception as exc:                        # noqa: BLE001
-            turn.error = f"The model could not write the answer: {exc}"
-            turn.answer = (f"The query ran but the answer could not be written. "
-                           f"{result.error or ''}").strip()
-            return turn
-
-        turn.answer = two.answer
-        turn.prompt_tokens += two.usage.prompt_tokens
-        turn.completion_tokens += two.usage.completion_tokens
-        turn.latency_ms += two.usage.latency_ms
-        turn.store_ids.append(self.store.log_message(
-            session_id=session_id, role="assistant", content=two.answer,
-            prompt_tokens=two.usage.prompt_tokens,
-            completion_tokens=two.usage.completion_tokens,
-            model=two.usage.model, latency_ms=two.usage.latency_ms))
-        return turn
+def block(title: str, body: str, colour: str = "") -> None:
+    print(f"\n{BOLD}{colour}{title}{RESET}")
+    for line in str(body).rstrip().splitlines():
+        print(f"  {line}")
 
 
-# --------------------------------------------------------------------- web app
+#: Longest group label shown. Product names carry codes and Arabic text and run
+#: past 70 characters, which wrecks the alignment.
+NAME_W = 34
 
-app = FastAPI(title="WAGS Insight")
-_app: Optional[App] = None
+#: Rows shown before "+N more". 97 unsorted products is not an answer.
+TOP_N = 15
+
+#: Column to sort a grouped table by, biggest first, per metric.
+SORT_BY = {"sales": "net_sales", "returns": "amount_untaxed",
+           "discounts": "discount_amount", "unposted_orders": "amount_untaxed",
+           "payments": "amount", "products": "quantity",
+           "modifiers": "quantity"}
 
 
-def get_app() -> App:
-    global _app
-    if _app is None:
-        _app = App()
-    return _app
+def table(data: dict, metric: str = "", top_n: int = TOP_N) -> str:
+    """One row per group. Sorted biggest first, trimmed, aligned."""
+    if not data:
+        return "(no rows)"
+    if list(data) == ["overall"]:
+        d = data["overall"]
+        pad = max(len(k) for k in d)
+        return "\n".join(f"{k:<{pad}}  {_num(v)}" for k, v in d.items())
+
+    cols = list(next(iter(data.values())))
+    sort_col = SORT_BY.get(metric) if SORT_BY.get(metric) in cols else cols[0]
+    rows = sorted(data.items(),
+                  key=lambda kv: -(kv[1].get(sort_col) or 0))
+    hidden = max(0, len(rows) - top_n)
+    rows = rows[:top_n]
+
+    labels = {k: (str(k)[:NAME_W - 1] + "…" if len(str(k)) > NAME_W else str(k))
+              for k, _ in rows}
+    key_w = max(len("group"), max(len(v) for v in labels.values()))
+    widths = [max(len(c), max(len(_num(v.get(c))) for _, v in rows))
+              for c in cols]
+
+    out = ["  ".join([f"{'group':<{key_w}}"] +
+                     [f"{c:>{w}}" for c, w in zip(cols, widths)]),
+           "  ".join(["─" * key_w] + ["─" * w for w in widths])]
+    for k, v in rows:
+        out.append("  ".join([f"{labels[k]:<{key_w}}"] +
+                             [f"{_num(v.get(c)):>{w}}"
+                              for c, w in zip(cols, widths)]))
+    if hidden:
+        out.append(f"{DIM}… and {hidden} more, sorted by {sort_col}{RESET}")
+    return "\n".join(out)
 
 
-@app.get("/health")
-def health():
-    a = get_app()
+def _num(v) -> str:
+    if v is None:
+        return "-"
+    if isinstance(v, float):
+        return f"{v:,.2f}"
+    if isinstance(v, int):
+        return f"{v:,}"
+    return str(v)
+
+
+# ---------------------------------------------------------------------- tool
+
+def tool_schema() -> dict:
+    """Generated from the whitelist, so the LLM is never offered a field name."""
+    groups = sorted({g for m in METRICS.values() for g in m.groups})
     return {
-        "ok": True,
-        "odoo_db": a.cfg.odoo_db,
-        "odoo_uid": a.odoo.uid,
-        "branches": len(a.lookups.branches),
-        "order_types": len(a.lookups.order_types),
-        "return_types": a.lookups.return_type_ids(),
-        "date_floor": str(a.cfg.data_start) if a.cfg.has_date_floor else None,
-        "today_used": str(a.today_fn()),
-        "supabase": a.store.enabled,
-        "store_errors": a.store.errors[-3:],
+        "type": "function",
+        "function": {
+            "name": "query_pos",
+            "description": "Fetch POS sales figures from the database. Use this "
+                           "only when the person is asking for a number.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "metric": {"type": "string", "enum": list(METRICS)},
+                    "period": {"type": "string", "enum": list(PERIODS)},
+                    "start_date": {"type": "string",
+                                   "description": "YYYY-MM-DD, custom only"},
+                    "end_date": {"type": "string",
+                                 "description": "YYYY-MM-DD, custom only"},
+                    "group_by": {"type": "array",
+                                 "items": {"type": "string", "enum": groups},
+                                 "description": "At most 2, only if a "
+                                                "breakdown was asked for"},
+                },
+                # period is required so the model states its choice rather than
+                # omitting it and silently inheriting a default.
+                "required": ["metric", "period"],
+                "additionalProperties": False,
+            },
+        },
     }
 
 
-@app.post("/ask")
-def ask(payload: dict):
-    a = get_app()
-    turn = a.ask(payload.get("question", ""),
-                 session_id=payload.get("session_id", ""))
-    return {
-        "status": turn.status,
-        "answer": turn.answer,
-        "tool_args": turn.tool_args,
-        "results": turn.result.data if turn.result and turn.result.ok else None,
-        "error": turn.error or (turn.result.error if turn.result else ""),
-        "prompt_tokens": turn.prompt_tokens,
-        "completion_tokens": turn.completion_tokens,
-        "latency_ms": turn.latency_ms,
-    }
+def system_prompt(lookups: Lookups) -> str:
+    metrics = "\n".join(
+        f"- {k}: {m.about}\n  groups: {', '.join(m.groups)}"
+        for k, m in METRICS.items())
+    return f"""You answer questions about POS sales for WAGS.
+
+You never write a query. You choose a metric and parameters, and the server
+runs the real query.
+
+Today is {odoo_db.TODAY}. Times are {odoo_db.TZ_NAME}. A week runs Monday to Sunday.
+
+METRICS
+{metrics}
+
+PERIODS
+{', '.join(PERIODS)}
+
+BRANCHES      {lookups.names('branches')}
+ORDER TYPES   {lookups.names('order_types')}
+
+NOT EVERY MESSAGE IS A DATA QUESTION
+Do not call the tool for greetings, thanks, small talk, or "what can you do".
+Reply in words instead. Answering "hi" with sales figures is wrong.
+
+ASK FOR THE LEAST YOU NEED
+Send no group_by unless a breakdown was actually asked for. "by", "per",
+"each", "which branch", "trend" ask for one. "How much", "how many", "what is",
+"total" do not. One question, one figure.
+
+WHEN NO PERIOD IS MENTIONED, USE all_time
+"total sales", "how much cash did we collect", "how many orders" carry no time
+window, so they mean everything on record. Do not assume today. Only use a
+narrower period when the question names one: "today", "last month", "in
+December", "this week".
+
+THE sales METRIC ALREADY RETURNS ALL OF THESE
+net sales, gross sales, returns, VAT, total with VAT, discounts, order count,
+return count, average ticket. So "how much VAT", "what is the average ticket"
+and "how many orders" are all metric=sales. Do not reach for payments to get
+VAT, and do not refuse these — they come back automatically.
+
+ONLY THESE ARE GENUINELY UNAVAILABLE
+Profit, margin, cost of goods, stock levels, staff hours, forecasts. There is
+no data for them. Do not answer with a different metric — a sales figure
+offered as a profit figure is worse than no answer. Say in words that you
+cannot do it and what you can do instead. Do not call the tool.
+"""
 
 
-def build_ui() -> gr.Blocks:
-    a = get_app()
-    session = uuid.uuid4().hex[:12]
+# -------------------------------------------------------------------- router
 
-    def respond(message, history):
-        prior = []
-        for h in (history or [])[-6:]:
-            if isinstance(h, dict):
-                prior.append({"role": h["role"], "content": h["content"]})
-        turn = a.ask(message, history=prior, session_id=session)
-        body = turn.answer or turn.error or "No answer."
-        if turn.tool_args:
-            body += f"\n\n<sub>`{turn.tool_args}` · {turn.prompt_tokens}+" \
-                    f"{turn.completion_tokens} tokens · {turn.latency_ms}ms</sub>"
-        return body
+class Router:
+    def __init__(self):
+        self.odoo = Odoo().connect()
+        self.lookups = self.odoo.load_lookups()
+        self.client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
+        self.tool = tool_schema()
 
-    floor = str(a.cfg.data_start) if a.cfg.has_date_floor else "none (all history)"
-    with gr.Blocks(title="WAGS Insight") as ui:
-        gr.Markdown(
-            f"### WAGS Insight\n"
-            f"Database `{a.cfg.odoo_db}` · timezone {a.cfg.tz_name} · "
-            f"date floor {floor} · today treated as {a.today_fn()}")
-        # Gradio 6 dropped the `type` argument; message dicts are the default.
-        gr.ChatInterface(
-            respond,
-            examples=["Total sales?",
-                      "Sales by month",
-                      "Which branch sells most?",
-                      "Top selling products",
-                      "How much cash did we take?",
-                      "TWN branch ki sales kitni hai?"],
-        )
-    return ui
+    def decide(self, question: str) -> dict:
+        """LLM call one. Returns {tool_args} or {reply}."""
+        started = time.time()
+        resp = self.client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system",
+                       "content": system_prompt(self.lookups)},
+                      {"role": "user", "content": question}],
+            tools=[self.tool], tool_choice="auto",
+            temperature=0, max_tokens=200)
+        ms = (time.time() - started) * 1000
+        u = resp.usage
+        msg = resp.choices[0].message
+        calls = getattr(msg, "tool_calls", None) or []
+        out = {"ms": int(ms), "prompt_tokens": u.prompt_tokens,
+               "completion_tokens": u.completion_tokens}
+        if calls:
+            args = json.loads(calls[0].function.arguments or "{}")
+            out["tool_args"] = {k: v for k, v in args.items()
+                                if v not in (None, "", [], {})}
+        else:
+            out["reply"] = (msg.content or "").strip()
+        return out
 
 
-def serve(host: str = "0.0.0.0", port: int = 7860) -> None:
-    """Mount the UI and serve.
+# ----------------------------------------------------------------------- run
 
-    The UI is built here rather than at import time so that importing ``App``
-    (golden_run.py does) neither connects to Odoo nor constructs Gradio.
-    """
-    import uvicorn
+def ask(router: Router, question: str, show_raw: bool = False) -> None:
+    head(f'QUESTION:  "{question}"')
 
-    mounted = gr.mount_gradio_app(app, build_ui(), path="/")
-    uvicorn.run(mounted, host=host, port=port)
+    # -- 1. does this need data at all?
+    try:
+        d = router.decide(question)
+    except Exception as exc:                            # noqa: BLE001
+        block("LLM CALL FAILED", str(exc)[:300], RED)
+        return
+
+    meta = (f"{d['prompt_tokens']}+{d['completion_tokens']} tokens · "
+            f"{d['ms']}ms")
+
+    if "reply" in d:
+        block("ROUTER", f"no tool call — not a data question   {DIM}{meta}{RESET}",
+              YELLOW)
+        block("REPLY", d["reply"])
+        print(f"\n  {DIM}Odoo was not contacted. No query ran.{RESET}")
+        return
+
+    args = d["tool_args"]
+    block("ROUTER", f"tool call — data needed   {DIM}{meta}{RESET}", GREEN)
+    block("INPUT — what the LLM chose", json.dumps(args, indent=2))
+
+    # -- 2. keys become a real query
+    try:
+        q = build_query(args, router.lookups)
+    except QueryError as exc:
+        block("REJECTED BY THE WHITELIST", str(exc), RED)
+        return
+
+    block("QUERY — exactly what is sent to Odoo",
+          f"model    {q.model}\n"
+          f"domain   " + "\n         ".join(str(t) for t in q.domain) + "\n"
+          f"fields   {q.fields}\n"
+          f"groupby  {q.groupby}\n"
+          f"context  {q.context}\n"
+          f"period   {q.period_label}")
+    block("QUERY — equivalent SQL", q.as_sql())
+
+    # -- 3. run it
+    try:
+        rows, ms = router.odoo.run(q)
+    except OdooError as exc:
+        block("ODOO FAILED", str(exc), RED)
+        return
+
+    print(f"\n  {DIM}{len(rows)} raw buckets in {ms:.0f}ms "
+          f"via {router.odoo.last_transport}{RESET}")
+
+    if show_raw:
+        block("RAW — exactly what Odoo returned",
+              "\n".join(json.dumps({k: v for k, v in r.items()
+                                    if k not in ("__domain", "__range")},
+                                   default=str) for r in rows[:12]))
+
+    # -- 4. the output shape
+    block("OUTPUT", table(summarise(rows, q, router.lookups), q.metric), GREEN)
+
+
+SAMPLES = ["hi", "total sales", "sales last month", "sales by branch",
+           "top selling products", "how much cash did we take"]
+
+
+def main() -> None:
+    show_raw = "--raw" in sys.argv
+    questions = [a for a in sys.argv[1:] if not a.startswith("--")] or SAMPLES
+    router = Router()
+    print(f"{DIM}db={odoo_db.ODOO_DB} uid={router.odoo.uid} "
+          f"today={odoo_db.TODAY} model={MODEL}{RESET}")
+    for q in questions:
+        ask(router, q, show_raw)
+    print()
 
 
 if __name__ == "__main__":
-    serve()
+    main()
