@@ -21,3 +21,7 @@ debug_chat.txt
 # these stay local. Remove these two lines only if the repo becomes private.
 golden_results.md
 golden_pairs.json
+
+# The field workbook is the human reference the registry (fields.py) was built
+# from. Kept local to keep the repo clean; example_questions.md is committed.
+*.xlsx

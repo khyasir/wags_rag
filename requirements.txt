@@ -1,0 +1,4 @@
+# Runtime dependencies for WAGS Insight.
+#   pip install -r requirements.txt
+openai>=1.40.0
+gradio>=5.0.0

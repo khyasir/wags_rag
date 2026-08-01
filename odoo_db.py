@@ -1,25 +1,21 @@
-"""RETRIEVE — everything that talks to Odoo, plus what is allowed to be asked.
+"""RETRIEVE — everything that talks to Odoo, and how a request becomes a query.
 
-Three parts, in order:
+The app is "constrained dynamic": the LLM does not write a query. It fills in a
+small form (a spec) and this file turns that spec into a real Odoo call — but
+only using the fields listed in ``fields.py`` and only in their allowed role
+(dimension = filter/group, measure = sum). Anything outside that is rejected.
 
-1. ``METRICS`` / ``GROUP_BY`` — the whitelist. The LLM sends keys; this is the
-   only place a key turns into a field name. A key that is not here is an
-   error, never a guess.
-2. ``build_query`` — pure. Tool arguments in, the exact Odoo call out. No
-   network, so it can be read and tested on its own.
-3. ``Odoo`` — the XML-RPC client that runs it.
+Parts, in order:
+1. config + dates (with the DATA_START floor).
+2. ``build_query`` — pure. spec in, the exact Odoo call out. No network.
+3. ``summarise`` — raw Odoo buckets folded into the figures shown to the user.
+4. ``Odoo`` — the XML-RPC client that runs it (JSON-RPC only for the NULL fault).
 
 Transport is XML-RPC, with one exception. Odoo 16 hardcodes ``allow_none=False``
-when marshalling XML-RPC replies (``odoo/addons/base/controllers/rpc.py``), so a
-``read_group`` SUM over a column that is NULL in every matched row makes the
-server fail to encode its own answer:
-
-    TypeError: cannot marshal None unless allow_none is enabled
-
-That is not hypothetical here — ``coupon_amount`` and ``voucher_amount`` are
-NULL on all 318 local orders, so the ``discounts`` metric hits it every time.
-When that specific fault appears the same call is retried over ``/jsonrpc``,
-which carries null natively. Everything else goes over XML-RPC as intended.
+when marshalling XML-RPC replies, so a ``read_group`` SUM over a column that is
+NULL in every matched row makes the server fail to encode its own answer
+(``cannot marshal None``). coupon_amount and voucher_amount hit this. When that
+specific fault appears the same call is retried over ``/jsonrpc``.
 """
 
 from __future__ import annotations
@@ -34,6 +30,9 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
+
+from fields import (DIMENSION, LINES, MEASURE, MODELS, ORDERS, PAYMENTS,
+                    SPECIAL_FILTERS, always_forced, date_field)
 
 # --------------------------------------------------------------------- config
 
@@ -60,104 +59,61 @@ ODOO_KEY = os.environ.get("ODOO_KEY") or os.environ.get("ODOO_PASSWORD", "")
 TZ_NAME = os.environ.get("TZ_NAME", "Asia/Riyadh")
 RPC_TIMEOUT = int(os.environ.get("RPC_TIMEOUT") or 30)
 
-#: Local data stops 2025-12-11 while the clock says 2026, so relative periods
-#: would all come back empty. Override with TODAY=YYYY-MM-DD.
+#: Print every build_query step to the terminal. On by default so you can watch
+#: how the spec turns into a real Odoo call. Set SHOW_QUERY=0 to silence.
+SHOW_QUERY = os.environ.get("SHOW_QUERY", "1").lower() not in ("0", "", "false", "no")
+
+#: The date floor. Blank (dev) = no floor, the whole history is queryable.
+#: Production ships DATA_START=2026-01-01, so nothing before 2026 is answered.
+def _floor() -> Optional[date]:
+    s = os.environ.get("DATA_START", "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+DATA_START = _floor()
+
+#: "Today" for relative periods. Override with TODAY=YYYY-MM-DD. Defaults to the
+#: real clock; on the local 2025 sample DB set TODAY in .env to test relatives.
 TODAY = (datetime.strptime(os.environ["TODAY"], "%Y-%m-%d").date()
-         if os.environ.get("TODAY") else date(2025, 12, 11))
+         if os.environ.get("TODAY") else date.today())
 
 UTC = ZoneInfo("UTC")
 DT_FMT = "%Y-%m-%d %H:%M:%S"
 
-ORDERS = "pos.wags"
-LINES = "pos.wags.tree"
-PAYMENTS = "pos.wags.payment.method"
-
-
-# ------------------------------------------------------------ THE WHITELIST
-
-@dataclass(frozen=True)
-class Metric:
-    model: str
-    date_field: str          # what a date range filters on
-    date_group: Optional[str]  # what a date grouping uses; None = not possible
-    aggregates: tuple
-    forced: tuple            # always applied, the LLM cannot remove it
-    groups: tuple
-    about: str
-    split_returns: bool = False
-    only_returns: bool = False
-
-
-METRICS: dict[str, Metric] = {
-    "sales": Metric(
-        ORDERS, "order_datetime", "order_datetime",
-        ("amount_untaxed", "amount_total", "amount_tax", "discount_amount"),
-        (("state", "=", "validate"),),
-        ("day", "week", "month", "branch", "order_type", "employee", "cashbox"),
-        "Net, gross and returns. Net is before VAT.",
-        split_returns=True),
-    "returns": Metric(
-        ORDERS, "order_datetime", "order_datetime",
-        ("amount_untaxed", "amount_total", "amount_tax"),
-        (("state", "=", "validate"),),
-        ("day", "week", "month", "branch", "order_type"),
-        "Return orders only.",
-        only_returns=True),
-    "discounts": Metric(
-        ORDERS, "order_datetime", "order_datetime",
-        ("discount_amount", "coupon_amount", "voucher_amount"),
-        (("state", "=", "validate"),),
-        ("day", "week", "month", "branch", "order_type"),
-        "Discounts, coupons and gift vouchers."),
-    "unposted_orders": Metric(
-        ORDERS, "order_datetime", "order_datetime",
-        ("amount_untaxed", "amount_total"),
-        (("state", "=", "validate"), ("session_order_link", "=", False)),
-        ("day", "week", "month", "branch"),
-        "Validated orders never posted to a session."),
-    "payments": Metric(
-        PAYMENTS, "order_datetime", "order_datetime",
-        ("amount",),
-        (("pos_id.state", "=", "validate"),),
-        ("day", "week", "month", "payment_method", "cashbox"),
-        "Money collected, by payment method. Includes VAT."),
-    "products": Metric(
-        LINES, "pos_id.order_datetime", None,
-        ("quantity", "price_subtotal", "price_total"),
-        (("pos_id.state", "=", "validate"),
-         "|", ("app_line_id", "<", 100000), ("app_line_id", "=", False)),
-        ("product", "pos_category", "branch", "order_type"),
-        "Product lines. Quantity is the main figure."),
-    "modifiers": Metric(
-        LINES, "pos_id.order_datetime", None,
-        ("quantity", "price_subtotal", "price_total"),
-        (("pos_id.state", "=", "validate"), ("app_line_id", ">=", 100000)),
-        ("product", "pos_category", "branch", "order_type"),
-        "Modifier lines, such as an extra shot."),
-}
-
 DATE_GRAINS = ("day", "week", "month")
-
-#: key -> {model: field}. Missing means that grouping is impossible there.
-#: Odoo's read_group cannot group by a related field, so line metrics have no
-#: date grouping and payments have no branch. Verified against the database.
-GROUP_BY: dict[str, dict] = {
-    "branch": {ORDERS: "branch_id", LINES: "branch_id"},
-    "order_type": {ORDERS: "order_type", LINES: "order_type_id"},
-    "employee": {ORDERS: "employee_id"},
-    "cashbox": {ORDERS: "cashbox_id", PAYMENTS: "cashbox_id"},
-    "product": {LINES: "product_id"},
-    "pos_category": {LINES: "pos_category_id"},
-    "payment_method": {PAYMENTS: "payment_method_id"},
-}
 
 PERIODS = ("today", "yesterday", "this_week", "last_week", "this_month",
            "last_month", "last_7_days", "last_30_days", "this_year",
            "last_year", "all_time", "custom")
 
+#: What each model totals when the spec names no measures.
+DEFAULT_MEASURES = {
+    ORDERS: ("amount_untaxed", "amount_tax", "amount_total",
+             "discount_amount", "coupon_amount", "voucher_amount"),
+    LINES: ("quantity", "price_subtotal", "price_total"),
+    PAYMENTS: ("amount",),
+}
+
+#: The keys the spec may contain. Anything else is rejected — this is what
+#: stops a raw ``domain`` or ``model`` string being smuggled past the whitelist.
+ALLOWED_SPEC = {"model", "measures", "group_by", "filters", "period",
+                "start_date", "end_date", "line_type", "unposted", "limit"}
+
 
 class QueryError(ValueError):
     """Rejected request. The message is safe to show the user."""
+
+
+def _truthy(v) -> bool:
+    """The LLM sometimes sends booleans as the strings 'true'/'false'."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes")
+    return bool(v)
 
 
 # ----------------------------------------------------------------- the dates
@@ -170,10 +126,11 @@ def _to_utc(d: date) -> str:
 
 def date_range(period: str, start: str = "", end: str = "",
                today: Optional[date] = None) -> tuple:
-    """(utc_from, utc_to, human_label). Bounds are half-open."""
+    """(utc_from, utc_to, human_label). Bounds are half-open, floored by DATA_START."""
     today = today or TODAY
     tom = today + timedelta(days=1)
     mon = today - timedelta(days=today.weekday())      # week starts Monday
+    a = b = None
 
     if period == "today":            a, b = today, tom
     elif period == "yesterday":      a, b = today - timedelta(days=1), today
@@ -188,7 +145,7 @@ def date_range(period: str, start: str = "", end: str = "",
     elif period == "this_year":      a, b = date(today.year, 1, 1), tom
     elif period == "last_year":
         a, b = date(today.year - 1, 1, 1), date(today.year, 1, 1)
-    elif period == "all_time":       return None, None, "all available data"
+    elif period == "all_time":       a, b = None, None
     elif period == "custom":
         if not start and not end:
             raise QueryError("A custom range needs a start or an end date.")
@@ -197,15 +154,29 @@ def date_range(period: str, start: str = "", end: str = "",
             b = (datetime.strptime(end, "%Y-%m-%d").date() + timedelta(days=1)
                  ) if end else None
         except ValueError:
-            raise QueryError("Dates must look like 2025-12-01.")
+            raise QueryError("Dates must look like 2026-01-01.")
         if a and b and b <= a:
             raise QueryError("The end date is before the start date.")
     else:
         raise QueryError(f"Unknown period '{period}'. "
                          f"Allowed: {', '.join(PERIODS)}.")
 
-    label = (f"{a} to {b - timedelta(days=1)}" if a and b and b - a > timedelta(days=1)
-             else str(a) if a else "all available data")
+    # Apply the DATA_START floor.
+    if DATA_START:
+        if b is not None and b <= DATA_START:
+            raise QueryError(
+                f"I can only look at data from {DATA_START} onward.")
+        if a is None or a < DATA_START:
+            a = DATA_START
+
+    if a is None:
+        label = "all available data"
+    elif b is None:
+        label = f"{a} onward"
+    elif b - a > timedelta(days=1):
+        label = f"{a} to {b - timedelta(days=1)}"
+    else:
+        label = str(a)
     return (_to_utc(a) if a else None), (_to_utc(b) if b else None), label
 
 
@@ -214,15 +185,16 @@ def date_range(period: str, start: str = "", end: str = "",
 @dataclass
 class Query:
     """The exact call that will be sent. This is what the UI displays."""
-    metric: str
     model: str
     domain: list
     fields: list
     groupby: list
     context: dict
     period_label: str
-    user_groups: list = field(default_factory=list)
-    split_returns: bool = False
+    measures: list = field(default_factory=list)
+    user_groups: list = field(default_factory=list)  # groupby the user asked for
+    is_orders: bool = False
+    limit: int = 0
 
     def as_sql(self) -> str:
         """Readable equivalent of what Odoo will run. For display only."""
@@ -235,25 +207,17 @@ class Query:
 
 
 def domain_to_sql(domain: list) -> str:
-    """Odoo's prefix-notation domain as an infix WHERE clause.
-
-    Odoo writes OR as a leading ``'|'`` applying to the next two terms, so
-    ``['|', a, b, c]`` means ``(a OR b) AND c``. Rendering the list left to
-    right with AND between everything reads as ``a AND b AND c`` — the opposite
-    of what runs. The products metric relies on an OR, so this display would
-    have quietly misrepresented the actual query.
-    """
+    """Odoo's prefix-notation domain as an infix WHERE clause (display only)."""
     def term(t) -> str:
-        field, op, val = t
+        f, op, val = t
         op = {"=": "=", "!=": "<>"}.get(op, op)
         if val is False and op == "=":
-            return f"{field} IS NULL"
+            return f"{f} IS NULL"
         if isinstance(val, (list, tuple)):
-            return f"{field} {op.upper()} ({', '.join(map(repr, val))})"
-        return f"{field} {op} {val!r}"
+            return f"{f} {op.upper()} ({', '.join(map(repr, val))})"
+        return f"{f} {op} {val!r}"
 
     def parse(items, i):
-        """Returns (sql_fragment, next_index)."""
         tok = items[i]
         if tok in ("|", "&"):
             left, i = parse(items, i + 1)
@@ -272,74 +236,179 @@ def domain_to_sql(domain: list) -> str:
     return " AND ".join(parts)
 
 
-def build_query(args: dict, lookups: "Lookups",
+def _resolve_filter(model: str, name: str, value, lookups: "Lookups") -> tuple:
+    """A dimension filter -> an Odoo domain term. Names are matched to ids where
+    a lookup table exists, otherwise matched loosely on the related name."""
+    val = value if isinstance(value, str) else str(value)
+    low = val.lower()
+
+    if name == "branch_id":
+        ids = [i for i, n in lookups.branches if low in n.lower()]
+        return ("branch_id", "in", ids) if ids else ("branch_id.name", "ilike", val)
+    if name in ("order_type", "order_type_id"):
+        ids = [i for i, n, _ in lookups.order_types if low in n.lower()]
+        return (name, "in", ids) if ids else (f"{name}.name", "ilike", val)
+    if name == "payment_method_id":
+        ids = [i for i, n, _ in lookups.payment_methods if low in n.lower()]
+        return (name, "in", ids) if ids else (f"{name}.name", "ilike", val)
+
+    f = MODELS[model].get(name)
+    rel = f.relation if f else None
+    if rel and rel not in ("char", "boolean", "selection", "datetime", "date"):
+        return (f"{name}.name", "ilike", val)      # any other Many2one, by name
+    if rel == "boolean":
+        return (name, "=", low not in ("false", "0", "no", "none", ""))
+    return (name, "ilike", val)                     # char / selection
+
+
+def build_query(spec: dict, lookups: "Lookups",
                 today: Optional[date] = None) -> Query:
-    """Tool arguments -> the exact Odoo call. Pure: no network."""
-    if not isinstance(args, dict):
-        raise QueryError("Arguments must be an object.")
+    """A spec -> the exact Odoo call. Pure: no network."""
+    if not isinstance(spec, dict):
+        raise QueryError("The query spec must be an object.")
 
-    allowed_args = {"metric", "period", "start_date", "end_date", "group_by"}
-    unknown = set(args) - allowed_args
+    unknown = set(spec) - ALLOWED_SPEC
     if unknown:
-        # This is what stops `domain`, `model` or raw SQL being smuggled in.
-        raise QueryError(f"Unknown argument(s): {', '.join(sorted(unknown))}. "
-                         f"Allowed: {', '.join(sorted(allowed_args))}.")
+        raise QueryError(f"Unknown field(s): {', '.join(sorted(unknown))}. "
+                         f"Allowed: {', '.join(sorted(ALLOWED_SPEC))}.")
 
-    name = args.get("metric")
-    if name not in METRICS:
-        raise QueryError(f"Unknown metric '{name}'. "
-                         f"Allowed: {', '.join(METRICS)}.")
-    m = METRICS[name]
+    model = spec.get("model")
+    if model not in MODELS:
+        raise QueryError(f"Unknown model '{model}'. "
+                         f"Allowed: {', '.join(MODELS)}.")
+    M = MODELS[model]
+    is_orders = model == ORDERS
 
+    # -- measures (what to total) ----------------------------------------
+    req = spec.get("measures") or []
+    if isinstance(req, str):
+        req = [req]
+    for name in req:
+        f = M.get(name)
+        if not f or f.role != MEASURE:
+            raise QueryError(
+                f"'{name}' is not a number you can total on {model}. "
+                f"Allowed: {', '.join(x.name for x in M.measures)}.")
+    # Orders always fetches the full sales set so returns can be folded out.
+    fetch = list(DEFAULT_MEASURES[ORDERS]) if is_orders else (
+        req or list(DEFAULT_MEASURES[model]))
+
+    # -- dates -----------------------------------------------------------
     utc_from, utc_to, label = date_range(
-        args.get("period") or "all_time", args.get("start_date") or "",
-        args.get("end_date") or "", today)
+        spec.get("period") or "all_time", spec.get("start_date") or "",
+        spec.get("end_date") or "", today)
 
-    domain = list(m.forced)                      # state filter, always first
-    if m.only_returns:
-        ids = lookups.return_type_ids()
-        if not ids:
-            raise QueryError("No order type is flagged as a return.")
-        domain.append(("order_type", "in", ids))
+    domain = list(always_forced(model))            # state = validate
+    dfield = date_field(model)
     if utc_from:
-        domain.append((m.date_field, ">=", utc_from))
+        domain.append((dfield, ">=", utc_from))
     if utc_to:
-        domain.append((m.date_field, "<", utc_to))
+        domain.append((dfield, "<", utc_to))
 
-    keys = args.get("group_by") or []
+    # -- special forced filters -----------------------------------------
+    special_used = []
+    if model == LINES:
+        lt = (spec.get("line_type") or "product").lower()
+        key = "modifiers" if lt.startswith("mod") else "products"
+        domain += SPECIAL_FILTERS[key]
+        special_used.append(key)
+    if is_orders and _truthy(spec.get("unposted")):
+        domain += SPECIAL_FILTERS["unposted_orders"]
+        special_used.append("unposted_orders")
+
+    # -- user filters ----------------------------------------------------
+    for filt in (spec.get("filters") or []):
+        if not isinstance(filt, dict) or "field" not in filt:
+            raise QueryError("Each filter needs a field and a value.")
+        name = filt["field"]
+        f = M.get(name)
+        if not f or f.role != DIMENSION:
+            raise QueryError(
+                f"Cannot filter by '{name}' on {model}. "
+                f"Allowed: {', '.join(x.name for x in M.dimensions)}.")
+        domain.append(_resolve_filter(model, name, filt.get("value"), lookups))
+
+    # -- group by --------------------------------------------------------
+    keys = spec.get("group_by") or []
     if isinstance(keys, str):
         keys = [keys]
-    keys = list(dict.fromkeys(keys))             # dedupe, keep order
+    keys = list(dict.fromkeys(keys))
     if len(keys) > 2:
         raise QueryError(f"At most 2 groupings. You asked for {len(keys)}.")
     if len([k for k in keys if k in DATE_GRAINS]) > 1:
         raise QueryError("Only one time grouping at a time.")
 
-    groupby = []
+    groupby, user_groups = [], []
     for k in keys:
         if k in DATE_GRAINS:
-            if not m.date_group:
+            if model == LINES:
                 raise QueryError(
-                    f"'{name}' cannot be grouped by {k} — order lines carry no "
-                    f"date of their own.")
-            groupby.append(f"{m.date_group}:{k}")
-        elif k in GROUP_BY and m.model in GROUP_BY[k] and k in m.groups:
-            groupby.append(GROUP_BY[k][m.model])
+                    f"Order lines carry no date of their own, so they cannot be "
+                    f"grouped by {k}.")
+            token = f"{dfield}:{k}"
+            groupby.append(token)
+            user_groups.append(token)
         else:
-            raise QueryError(f"'{name}' cannot be grouped by '{k}'. "
-                             f"Allowed: {', '.join(m.groups)}.")
+            f = M.get(k)
+            if not f or f.role != DIMENSION:
+                raise QueryError(
+                    f"Cannot group by '{k}' on {model}. "
+                    f"Allowed: {', '.join(x.name for x in M.dimensions)}.")
+            groupby.append(k)
+            user_groups.append(k)
 
-    # Sales always splits by order type internally, so returns can be separated
-    # whether or not the user asked for that breakdown.
-    if m.split_returns:
-        f = GROUP_BY["order_type"][m.model]
-        if f not in groupby:
-            groupby.append(f)
+    # Orders always splits by order type internally so returns are separable.
+    if is_orders and "order_type" not in groupby:
+        groupby.append("order_type")
 
-    return Query(metric=name, model=m.model, domain=domain,
-                 fields=[f"{a}:sum" for a in m.aggregates], groupby=groupby,
-                 context={"tz": TZ_NAME}, period_label=label,
-                 user_groups=keys, split_returns=m.split_returns)
+    q = Query(model=model, domain=domain,
+              fields=[f"{a}:sum" for a in fetch], groupby=groupby,
+              context={"tz": TZ_NAME}, period_label=label, measures=fetch,
+              user_groups=user_groups, is_orders=is_orders,
+              limit=int(spec.get("limit") or 0))
+
+    if SHOW_QUERY:
+        _show_build(spec, q, utc_from, utc_to, special_used)
+    return q
+
+
+def _show_build(spec, q: Query, utc_from, utc_to, special_used) -> None:
+    """Print, step by step, how the spec turned into a query."""
+    C, B, D, R = "\033[36m", "\033[1m", "\033[2m", "\033[0m"
+    line = "─" * 70
+    print(f"\n{C}{line}\n build_query — how the query is created\n{line}{R}")
+
+    print(f"{B}1. SPEC — what the LLM chose{R}")
+    print(f"   {json.dumps(spec)}")
+
+    print(f"{B}2. model{R}")
+    print(f"   {q.model}")
+    print(f"   {D}forced (always on): state = validate"
+          + (f"; special: {', '.join(special_used)}" if special_used else "")
+          + f"{R}")
+
+    print(f"{B}3. period → dates{R}")
+    print(f"   {spec.get('period') or 'all_time'}  →  {q.period_label}")
+    print(f"   {D}from {utc_from or '—'}  to {utc_to or '—'}  (UTC, half-open){R}")
+
+    print(f"{B}4. measures → totals{R}")
+    print(f"   {', '.join(q.measures)}")
+
+    print(f"{B}5. group by{R}")
+    print(f"   {', '.join(q.groupby) if q.groupby else '(none)'}"
+          + (f"   {D}(order_type added to split returns){R}"
+             if q.is_orders and 'order_type' not in q.user_groups else ""))
+
+    print(f"{B}6. FINAL query object{R}")
+    print(f"   model    {q.model}")
+    print(f"   domain   " + "\n            ".join(str(t) for t in q.domain))
+    print(f"   fields   {q.fields}")
+    print(f"   groupby  {q.groupby}")
+
+    print(f"{B}7. equivalent SQL{R}")
+    for l in q.as_sql().splitlines():
+        print(f"   {l}")
+    print(f"{C}{line}{R}\n")
 
 
 # ------------------------------------------------------------------- lookups
@@ -366,7 +435,7 @@ class Lookups:
             if n in seen:
                 continue
             seen.add(n)
-            out.append(f"{r[0]}={n}")
+            out.append(str(n))
             if len(out) >= limit:
                 break
         return ", ".join(out)
@@ -416,7 +485,6 @@ class Odoo:
         except xmlrpc.client.Fault as fault:
             if "cannot marshal None" not in str(fault.faultString):
                 raise OdooError(_tidy(fault)) from fault
-            # Odoo cannot encode its own reply. Same call, different endpoint.
             self.last_transport = "XML-RPC failed on a NULL total, retried over JSON-RPC"
             return self._json(model, method, args, kw or {})
         except Exception as exc:                        # noqa: BLE001
@@ -447,8 +515,6 @@ class Odoo:
 
         ``active_test=False`` is essential: the only order type flagged
         ``is_return`` is archived, and Odoo hides archived records by default.
-        Without it the cache reports zero return types and return orders get
-        counted into gross sales in silence.
         """
         ctx = {"context": {"active_test": False}}
         br = self.call("branch.wags", "search_read", [[], ["name"]], ctx)
@@ -474,6 +540,29 @@ class Odoo:
                          {"lazy": False, "context": q.context})
         return rows, (_t.time() - started) * 1000
 
+    def find_order(self, ref: str) -> Optional[dict]:
+        """One order by reference or transaction id, with its product lines."""
+        ref = (ref or "").strip()
+        if not ref:
+            return None
+        head_fields = ["reference", "transaction_id", "branch_id", "order_type",
+                       "order_datetime", "state", "amount_untaxed", "amount_tax",
+                       "amount_total", "discount_amount", "coupon_amount",
+                       "voucher_amount"]
+        recs = self.call(ORDERS, "search_read",
+                         [["|", ("reference", "=", ref),
+                           ("transaction_id", "=", ref)], head_fields],
+                         {"limit": 1, "context": {"tz": TZ_NAME}})
+        if not recs:
+            return None
+        order = recs[0]
+        lines = self.call(LINES, "search_read",
+                          [[("pos_id", "=", order["id"])],
+                           ["product_id", "quantity", "price_unit",
+                            "price_subtotal", "price_total", "app_line_id"]],
+                          {"context": {"tz": TZ_NAME}})
+        return {"order": order, "lines": lines}
+
 
 def _tidy(fault: xmlrpc.client.Fault) -> str:
     lines = [l for l in str(fault.faultString).strip().splitlines() if l.strip()]
@@ -489,29 +578,36 @@ def _label(v):
 
 
 def summarise(rows: list, q: Query, lookups: Lookups) -> dict:
-    """Raw Odoo buckets -> the figures the LLM is allowed to see.
+    """Raw Odoo buckets -> the figures shown to the user.
 
-    For sales this folds the internal order-type dimension away into net, gross
-    and returns. Returns are separate records holding positive amounts, so net
-    is gross minus returns, and net is never reported on its own.
+    Orders fold the internal order-type dimension into net, gross and returns.
+    Returns are separate records holding positive amounts, so net = gross minus
+    returns. Everything else is a plain sum of the requested measures.
     """
-    if not q.split_returns:
-        return _plain(rows, q)
+    if q.is_orders:
+        buckets: dict = {}
+        for r in rows:
+            key = " / ".join(str(_label(r.get(f))) for f in q.user_groups) or "overall"
+            buckets.setdefault(key, []).append(r)
+        return {k: _fold(v, "order_type", lookups) for k, v in buckets.items()}
 
-    type_field = GROUP_BY["order_type"][q.model]
-    group_fields = [_group_field(q, k) for k in q.user_groups
-                    if k != "order_type"]
+    aggs = q.measures
+    if not q.user_groups:
+        out = {a: round(sum(r.get(a) or 0.0 for r in rows), 2) for a in aggs}
+        out["records"] = sum(r.get("__count") or 0 for r in rows)
+        return {"overall": out}
 
-    buckets: dict = {}
+    buckets = {}
     for r in rows:
-        key = " / ".join(str(_label(r.get(f))) for f in group_fields) or "overall"
+        key = " / ".join(str(_label(r.get(f))) for f in q.user_groups)
         buckets.setdefault(key, []).append(r)
-
-    return {k: _fold(v, type_field, lookups) for k, v in buckets.items()}
+    return {k: {**{a: round(sum(r.get(a) or 0.0 for r in v), 2) for a in aggs},
+                "records": sum(r.get("__count") or 0 for r in v)}
+            for k, v in buckets.items()}
 
 
 def _fold(rows, type_field, lookups) -> dict:
-    gross = ret = tax = total = disc = 0.0
+    gross = ret = tax = total = disc = coup = vouch = 0.0
     n = nret = 0
     for r in rows:
         u = r.get("amount_untaxed") or 0.0
@@ -527,6 +623,8 @@ def _fold(rows, type_field, lookups) -> dict:
             tax += r.get("amount_tax") or 0.0
             total += r.get("amount_total") or 0.0
             disc += r.get("discount_amount") or 0.0
+            coup += r.get("coupon_amount") or 0.0
+            vouch += r.get("voucher_amount") or 0.0
     return {
         "net_sales": round(gross - ret, 2),
         "gross_sales": round(gross, 2),
@@ -534,31 +632,9 @@ def _fold(rows, type_field, lookups) -> dict:
         "vat": round(tax, 2),
         "total_with_vat": round(total, 2),
         "discounts": round(disc, 2),
+        "coupons": round(coup, 2),
+        "vouchers": round(vouch, 2),
         "orders": n,
         "return_count": nret,
         "average_ticket": round((gross - ret) / n, 2) if n else None,
     }
-
-
-def _plain(rows: list, q: Query) -> dict:
-    aggs = [f.split(":")[0] for f in q.fields]
-    if not q.user_groups:
-        out = {a: round(sum(r.get(a) or 0.0 for r in rows), 2) for a in aggs}
-        out["records"] = sum(r.get("__count") or 0 for r in rows)
-        return {"overall": out}
-
-    fields = [_group_field(q, k) for k in q.user_groups]
-    buckets: dict = {}
-    for r in rows:
-        key = " / ".join(str(_label(r.get(f))) for f in fields)
-        buckets.setdefault(key, []).append(r)
-    return {k: {**{a: round(sum(r.get(a) or 0.0 for r in v), 2) for a in aggs},
-                "records": sum(r.get("__count") or 0 for r in v)}
-            for k, v in buckets.items()}
-
-
-def _group_field(q: Query, key: str) -> str:
-    m = METRICS[q.metric]
-    if key in DATE_GRAINS:
-        return f"{m.date_group}:{key}"
-    return GROUP_BY[key][q.model]
