@@ -1,0 +1,23 @@
+.env
+*.env
+!.env.example
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+.DS_Store
+
+# Golden-run log. The results themselves (golden_results.md, golden_pairs.json)
+# are kept on purpose — they are the review artefact.
+golden_run.log
+server.log
+debug_chat.txt
+
+# Real WAGS sales figures, branch and product names. This repo is public, so
+# these stay local. Remove these two lines only if the repo becomes private.
+golden_results.md
+golden_pairs.json
