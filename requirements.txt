@@ -1,4 +1,6 @@
 # Runtime dependencies for WAGS Insight.
 #   pip install -r requirements.txt
+# gradio>=4.44 keeps it installable on older Python (3.8/3.9) too; newer
+# interpreters will still pull a current 5.x/6.x release automatically.
 openai>=1.40.0
-gradio>=5.0.0
+gradio>=4.44

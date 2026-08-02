@@ -12,6 +12,7 @@ All the thinking lives in main.py, odoo_db.py and fields.py. This file renders.
 from __future__ import annotations
 
 import json
+from typing import Optional
 
 import gradio as gr
 
@@ -19,7 +20,7 @@ import odoo_db
 from main import Router, order_lines, sort_col
 from odoo_db import OdooError, QueryError, build_query, summarise
 
-router: Router | None = None
+router: Optional[Router] = None
 
 #: Invisible marker on real answers, so clarifying replies can be counted.
 ANSWERED = "<!--answered-->"
@@ -209,4 +210,4 @@ if __name__ == "__main__":
     router = Router()
     print(f"db={odoo_db.ODOO_DB} uid={router.odoo.uid} "
           f"today={odoo_db.TODAY} model={router.label}")
-    build().launch(server_name="0.0.0.0", server_port=7860)
+    build().launch(server_name="0.0.0.0", server_port=7860, share=True)

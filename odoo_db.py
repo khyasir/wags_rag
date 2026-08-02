@@ -29,7 +29,10 @@ import xmlrpc.client
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Optional
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo          # Python 3.9+
+except ImportError:                         # Python 3.8 fallback
+    from backports.zoneinfo import ZoneInfo
 
 from fields import (DIMENSION, LINES, MEASURE, MODELS, ORDERS, PAYMENTS,
                     SPECIAL_FILTERS, always_forced, date_field)
