@@ -209,5 +209,4 @@ if __name__ == "__main__":
     router = Router()
     print(f"db={odoo_db.ODOO_DB} uid={router.odoo.uid} "
           f"today={odoo_db.TODAY} model={router.label}")
-    build().launch(server_name="0.0.0.0", server_port=7860, inbrowser=True,
-                   share=True)
+    build().launch(server_name="0.0.0.0", server_port=7860)

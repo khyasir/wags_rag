@@ -1,3 +1,14 @@
+---
+title: WAGS Insight
+emoji: 📊
+colorFrom: blue
+colorTo: indigo
+sdk: gradio
+sdk_version: 6.16.0
+app_file: app_frontend.py
+pinned: false
+---
+
 # WAGS Insight — Task 01
 
 Chat app that answers POS sales questions from Odoo 16. The model never writes a
