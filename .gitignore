@@ -25,3 +25,7 @@ golden_pairs.json
 # The field workbook is the human reference the registry (fields.py) was built
 # from. Kept local to keep the repo clean; example_questions.md is committed.
 *.xlsx
+
+# Gradio scratch files (share certificate, flagged data, cache).
+.gradio/
+.venv/
