@@ -21,7 +21,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_USER: Yasirkrauf
-          HF_SPACE: Wags-POS-Rag
+          HF_SPACE: Wags_POS_Rag
         run: |
           git push --force \
             "https://${HF_USER}:${HF_TOKEN}@huggingface.co/spaces/${HF_USER}/${HF_SPACE}" \
