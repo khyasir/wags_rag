@@ -262,11 +262,12 @@ class Router:
             model=self.model, messages=messages, tools=self.tools,
             tool_choice="auto", temperature=0, max_tokens=300)
         ms = (time.time() - started) * 1000
-        u = resp.usage
+        u = resp.usage                       # OpenRouter may return None here
         msg = resp.choices[0].message
         calls = getattr(msg, "tool_calls", None) or []
-        out = {"ms": int(ms), "prompt_tokens": u.prompt_tokens,
-               "completion_tokens": u.completion_tokens}
+        out = {"ms": int(ms),
+               "prompt_tokens": getattr(u, "prompt_tokens", 0) if u else 0,
+               "completion_tokens": getattr(u, "completion_tokens", 0) if u else 0}
 
         if calls:
             call = calls[0]
